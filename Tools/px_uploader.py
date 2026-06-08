@@ -652,6 +652,12 @@ class uploader:
 
         # Prevent uploads where the image would overflow the flash
         if self.fw_maxsize < fw.property('image_size'):
+            print(f"  Board flash (from bootloader) : {self.fw_maxsize} bytes")
+            print(f"  Firmware image_size            : {fw.property('image_size')} bytes")
+            print(f"  Firmware image_maxsize         : {fw.property('image_maxsize')} bytes")
+            print(f"  Board type (bootloader)        : {self.board_type}")
+            print(f"  Firmware board_id              : {fw.property('board_id')}")
+            print(f"  Overflow by                    : {fw.property('image_size') - self.fw_maxsize} bytes")
             raise RuntimeError("Firmware image is too large for this board")
 
         # OTP added in v4:

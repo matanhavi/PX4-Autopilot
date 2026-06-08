@@ -1,0 +1,4 @@
+{
+  "red": ["ERROR", "ERR"],
+  "orange": ["Warning", "WRN", "WARN"]
+}
