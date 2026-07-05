@@ -27,6 +27,7 @@ class Console:
                 "no console broker on %s:%s - start it with "
                 "console.py [--headless]" % (host, port)) from e
         self.statuses = []
+        self.board = None          # last board name the broker detected, or None
         self._q = queue.Queue()
         self._running = True
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
@@ -46,6 +47,9 @@ class Console:
                 self._q.put(line[4:])
             elif line.startswith("STATUS "):
                 self.statuses.append(line[7:])
+            elif line.startswith("BOARD "):
+                name = line[6:]
+                self.board = None if name == "?" else name
             # PONG and anything else are ignored
 
     def send(self, text):

@@ -33,6 +33,11 @@ def strip_ansi(text):
     return _ANSI_RE.sub("", text)
 
 
+# PX4 'ver all' prints "HW arch: <BOARD>" -- used to identify which board is on
+# this console, so a swapped adapter / multi-board setup can't be confused.
+_HWARCH_RE = re.compile(r"HW arch:\s*(\S+)")
+
+
 def usb_info(port):
     """Best-effort USB identity for a serial device, for the header/log.
 
@@ -218,6 +223,7 @@ class Broker:
         self._serial = None
         self._serial_lock = threading.Lock()
         self._linebuf = LineBuffer()
+        self._board = None          # detected 'HW arch' board name, or None
 
         self._clients = set()
         self._clients_lock = threading.Lock()
@@ -309,13 +315,36 @@ class Broker:
                     self._log.log_output(line)
                     self._broadcast("OUT " + line)
                     self._emit("output", line)
+                    self._detect_board(line)
             else:
                 threading.Event().wait(0.02)
+
+    # ---- board identity ----------------------------------------------
+    def _detect_board(self, line):
+        """Update the detected board name from any 'HW arch:' line that flows
+        past (boot banner or a 'ver all' reply)."""
+        m = _HWARCH_RE.search(line)
+        if m and m.group(1) != self._board:
+            self._board = m.group(1)
+            self._log.log_status("board " + self._board)
+            self._broadcast("BOARD " + self._board)
+            self._emit("board", self._board)
+
+    def probe_board(self):
+        """Ask the device to identify itself. The 'HW arch:' line in the reply
+        is picked up by _detect_board and updates the board header. No-op if the
+        port is not currently open."""
+        self.send("ver all", "AUTO")
 
     def _announce_disconnected(self):
         if not self._disc_announced:
             self._disc_announced = True
             self._connected = False
+            # Forget the board so a reconnect (possibly a different adapter/board)
+            # re-identifies instead of showing a stale name.
+            self._board = None
+            self._broadcast("BOARD ?")
+            self._emit("board", None)
             self._set_status("disconnected")
 
     def _try_open(self):
@@ -330,6 +359,9 @@ class Broker:
         self._connected = True
         self._disc_announced = False
         self._set_status("connected %s %s" % (self._port, self._baud))
+        # Identify the board shortly after connecting (delay lets a booting
+        # board reach its prompt; a fresh boot banner also self-identifies).
+        threading.Timer(1.5, self.probe_board).start()
 
     def _handle_drop(self):
         with self._serial_lock:
@@ -362,6 +394,10 @@ class Broker:
         with self._clients_lock:
             try:
                 conn.sendall(("STATUS " + status + "\n").encode())
+                # Tell the new client the board we've already identified, so it
+                # doesn't have to wait for the next change to broadcast.
+                if self._board:
+                    conn.sendall(("BOARD " + self._board + "\n").encode())
             except OSError:
                 return
         f = conn.makefile("r")
@@ -415,6 +451,7 @@ class ConsoleGUI:
         "SKILL": "#5fd7ff",   # cyan
         "OUT": "#d0d0d0",     # grey
         "STAT": "#ffd75f",    # yellow
+        "AUTO": "#6a6a6a",    # dim - console's own auto-probe (ver all)
     }
 
     def __init__(self, broker, log_path, color_rules=None):
@@ -451,6 +488,18 @@ class ConsoleGUI:
         tk.Label(top, text=usb_info(self._broker_port()),
                  fg="#8a8a8a", bg="#1c1c1c", anchor="w",
                  font=("monospace", 9)).pack(side="left", padx=6, pady=2)
+
+        # Board identity header: the HW arch reported by 'ver all', so you always
+        # know WHICH board answered on this console. Refresh re-runs the probe.
+        hdr = tk.Frame(self._root, bg="#141414")
+        hdr.pack(fill="x")
+        tk.Button(hdr, text="↻ Refresh",
+                  command=self._refresh_board).pack(side="right", padx=4, pady=2)
+        tk.Label(hdr, text="Board:", fg="#8a8a8a", bg="#141414").pack(side="left", padx=(6, 2))
+        self._board_label = tk.Label(hdr, text="(detecting…)", fg="#ffd75f",
+                                     bg="#141414", font=("monospace", 11, "bold"),
+                                     anchor="w")
+        self._board_label.pack(side="left")
 
         self._text = tk.Text(self._root, bg="#101010", fg="#d0d0d0",
                              insertbackground="#d0d0d0",
@@ -522,6 +571,19 @@ class ConsoleGUI:
             elif kind == "status":
                 self._append("STAT", "[" + payload + "]")
                 self._update_status(payload)
+            elif kind == "board":
+                self._update_board(payload)
+
+    def _update_board(self, name):
+        if name:
+            self._board_label.configure(text=name, fg="#5fd7ff")
+            self._root.title("PX4 Console - %s - %s" % (name, self._broker_port()))
+        else:
+            self._board_label.configure(text="(detecting…)", fg="#ffd75f")
+
+    def _refresh_board(self):
+        self._board_label.configure(text="(detecting…)", fg="#ffd75f")
+        self._broker.probe_board()
 
     def _update_status(self, payload):
         logname = os.path.basename(self._log_path)
