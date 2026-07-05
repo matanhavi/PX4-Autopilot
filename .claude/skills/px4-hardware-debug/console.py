@@ -66,23 +66,43 @@ def find_keyword_spans(text, rules):
 
 
 class LineBuffer:
-    """Accumulates text and yields complete lines (trailing '\\r' stripped)."""
+    """Accumulates text and yields complete lines.
+
+    A line ends on LF ('\\n'), CR ('\\r'), or CRLF ('\\r\\n') -- all three are
+    treated as one line break. Handling a bare CR matters for two cases the
+    old LF-only logic silently swallowed: devices that terminate with CR only,
+    and a TX<->RX loopback, which echoes back only the CR the broker writes
+    (see Broker.send) and so would otherwise never surface. CRLF is collapsed
+    to a single break -- including when the CR and LF land in separate reads --
+    so normal NuttX output ('\\r\\n') does not yield spurious blank lines.
+    """
 
     def __init__(self):
         self._buf = ""
+        self._swallow_lf = False   # true right after a CR, to absorb its LF
 
     def feed(self, text):
-        self._buf += text
         lines = []
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            lines.append(line.rstrip("\r"))
+        for ch in text:
+            if ch == "\r":
+                lines.append(self._buf)
+                self._buf = ""
+                self._swallow_lf = True
+            elif ch == "\n":
+                if self._swallow_lf:
+                    self._swallow_lf = False   # CRLF: LF already closed the line
+                else:
+                    lines.append(self._buf)
+                    self._buf = ""
+            else:
+                self._swallow_lf = False
+                self._buf += ch
         return lines
 
     def flush(self):
         if self._buf == "":
             return None
-        pending = self._buf.rstrip("\r")
+        pending = self._buf
         self._buf = ""
         return pending
 
@@ -434,8 +454,11 @@ class ConsoleGUI:
                 # log and TCP stream keep the original bytes.
                 self._append_output(strip_ansi(payload))
             elif kind == "input":
+                # Show what we sent, tagged by source (USER/SKILL). Don't prefix
+                # a fake "nsh> " prompt -- it's not from the device and reads as
+                # a real prompt even on a loopback or a board that never replied.
                 source, text = payload
-                self._append(source, "nsh> " + text)
+                self._append(source, text)
             elif kind == "status":
                 self._append("STAT", "[" + payload + "]")
                 self._update_status(payload)
