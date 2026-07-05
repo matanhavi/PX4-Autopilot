@@ -33,6 +33,61 @@ def strip_ansi(text):
     return _ANSI_RE.sub("", text)
 
 
+def usb_info(port):
+    """Best-effort USB identity for a serial device, for the header/log.
+
+    Returns a one-line string like::
+
+        /dev/ttyUSB0  ·  bus 1-2  ·  by-path 0:2  ·  FTDI FT232R USB UART
+        ·  0403:6001  ·  SN A5069RR4
+
+    The physical bus path ('1-2') and by-path ('0:2') are what actually tell
+    two adapters apart -- the ttyUSBx number can swap on replug, and cheap
+    FTDIs often share one serial, so neither is a reliable identifier alone.
+    Falls back to just the resolved device path when /sys is unavailable
+    (e.g. a non-USB port), and never raises.
+    """
+    real = os.path.realpath(port)
+    fields = [real]
+    try:
+        sysdev = "/sys/class/tty/%s/device" % os.path.basename(real)
+        node = os.path.realpath(sysdev)
+        while (node and node != "/"
+               and not os.path.exists(os.path.join(node, "idVendor"))):
+            node = os.path.dirname(node)
+
+        def _read(attr):
+            try:
+                with open(os.path.join(node, attr)) as fh:
+                    return fh.read().strip()
+            except OSError:
+                return None
+
+        if node and node != "/":
+            fields.append("bus %s" % os.path.basename(node))   # e.g. 1-2
+        bp_dir = "/dev/serial/by-path"
+        if os.path.isdir(bp_dir):
+            for link in os.listdir(bp_dir):
+                if os.path.realpath(os.path.join(bp_dir, link)) == real:
+                    # ...-usb-0:2:1.0-port0 -> show the '0:2' port hint
+                    m = re.search(r"usb-(\d+:\d+)", link)
+                    fields.append("by-path %s" % (m.group(1) if m else link))
+                    break
+        label = " ".join(x for x in (_read("manufacturer"),
+                                     _read("product")) if x)
+        if label:
+            fields.append(label)
+        vid, pid = _read("idVendor"), _read("idProduct")
+        if vid and pid:
+            fields.append("%s:%s" % (vid, pid))
+        serial = _read("serial")
+        if serial:
+            fields.append("SN %s" % serial)
+    except Exception:
+        pass
+    return "  ·  ".join(fields)
+
+
 # External, user-editable keyword highlighting config (JSON: color -> [keywords]).
 COLOR_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "console_colors.json")
@@ -391,6 +446,11 @@ class ConsoleGUI:
                                 % os.path.basename(self._log_path),
                                 fg="#ffd75f", bg="#1c1c1c", anchor="e")
         self._status.pack(side="right", padx=6, pady=2)
+        # USB identity header: which physical adapter this window is bound to,
+        # so a swapped ttyUSBx number or shared FTDI serial can't mislead.
+        tk.Label(top, text=usb_info(self._broker_port()),
+                 fg="#8a8a8a", bg="#1c1c1c", anchor="w",
+                 font=("monospace", 9)).pack(side="left", padx=6, pady=2)
 
         self._text = tk.Text(self._root, bg="#101010", fg="#d0d0d0",
                              insertbackground="#d0d0d0",
@@ -557,13 +617,19 @@ def main(argv=None):
         return 1
 
     log = SessionLog(LOG_DIR)
+    # Record which physical USB adapter we're bound to at the top of the log
+    # and on stdout, so a session transcript is self-describing even headless.
+    usb = usb_info(args.port)
+    log.log_status("usb " + usb)
     broker = Broker(args.port, args.baud, args.tcp_port, log)
     broker.start()
 
     if args.headless:
         sys.stdout.write(
-            "[console] headless broker on 127.0.0.1:%d, logging to %s\n"
-            % (broker.tcp_port, log.path))
+            "[console] headless broker on 127.0.0.1:%d\n"
+            "[console] usb: %s\n"
+            "[console] logging to %s\n"
+            % (broker.tcp_port, usb, log.path))
         sys.stdout.flush()
         stop = threading.Event()
 
