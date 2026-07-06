@@ -91,18 +91,69 @@ from console_client import Console
 
 c = Console()                 # connects to the running broker
 c.send("ver all")            # fire-and-forget
-print(c.read_until("nsh>", timeout=5.0))   # quick command
+print(c.read_until("nsh>", timeout=5.0))   # convenience ONLY — not a reliable
+                                            # liveness signal (see next section)
 c.send("uorb top")           # streaming: keep reading, then ^C to stop
 # ... loop c.read() as needed ...
 c.send("\x03")
 c.close()
 ```
 
+> ⚠️ **`read()` / `read_until()` lie about liveness.** They frequently return
+> empty or partial output *even when the board answered*. **Verify everything via
+> the session log**, never from `read()`'s return — see the next section.
+
 The broker refuses to start if one is already running on its TCP port, so it is
 safe to attempt a start at session begin. Session logs land in
 `.claude/skills/px4-hardware-debug/logs/` (git-ignored). The headed GUI needs
 `python3-tk` installed (`sudo apt install python3-tk`); without it, use
 `--headless`.
+
+### Reading output: the session log is ground truth (READ THIS)
+
+**`Console.read()` / `read_until()` are best-effort and routinely return empty or
+partial output even when the board is alive and answering.** They drain a
+per-connection queue with a timeout, so they silently miss anything that arrives
+after the timeout, anything buffered during verbose boot / high-rate output, and
+anything a freshly-created short-lived `Console()` wasn't connected in time to
+catch. **Never conclude "the board is frozen" or "the command produced no
+output" from an empty `read()`.** The broker writes *every* byte to the session
+log reliably regardless of client timing — use that:
+
+```bash
+newest=$(ls -t .claude/skills/px4-hardware-debug/logs/*.log | head -1)
+tr -d '\000' < "$newest" > /tmp/log_clean.txt   # STRIP NULs first, or grep sees a
+                                                 # binary file and prints nothing!
+grep -a 'OUT' /tmp/log_clean.txt | tail -40      # board -> host output only
+```
+
+Log line format: `TS  OUT  <board output>`, `TS  SKILL > <cmd the skill sent>`,
+`TS  USER > <cmd typed in the GUI>`, `TS  STAT  <connect/disconnect>`. Compare
+timestamps to see exactly when the board last spoke.
+
+**Liveness / freeze check — the reliable pattern.** Send a *unique* marker, wait,
+then confirm it was echoed back in the log (do NOT trust `read()`):
+
+```python
+c.send("echo ALIVE_7F3")     # use a UNIQUE token each time — the log accumulates
+```
+```bash
+tr -d '\000' < "$newest" | grep -a 'OUT' | grep -a 'ALIVE_7F3'   # match => ALIVE
+```
+
+A match in an `OUT` line → alive. **No `OUT` echo after your commands → genuinely
+frozen.** To pinpoint *when* something died: fire several timestamped markers
+after the action under test (`echo TK_0` … `echo TK_8`, ~1 s apart), then count
+how many were echoed and note the timestamp of the last `OUT` line.
+
+Gotchas learned the hard way:
+- The board can take **> 1 s** to answer (verbose boot, busy CPU, `set -x`); use
+  generous waits and always confirm from the log, not the `read()` return.
+- After a flash/reboot the FTDI may re-enumerate into a **new** `session-*.log` —
+  re-resolve `newest` with `ls -t` every time; don't cache the path.
+- The FTDI adapter is **host-powered**, so `/dev/ttyUSB0` and the broker stay
+  "connected" even when the board is dead. Device presence ≠ liveness — only
+  fresh `OUT` bytes prove the board is alive.
 
 ### Manual UART console (single user)
 
