@@ -18,8 +18,12 @@ try:
 except ImportError:  # pragma: no cover - serial only needed at runtime
     serial = None
 
+from flash_status import parse_flash_line, build_flash_cmd, run_flash, valid_target
+
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 DEFAULT_TCP_PORT = 8765
+_REPO_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 
 # ANSI escape sequences: CSI (\x1b[ ... final) plus two-character escapes.
 # Screen-redraw commands like `top`/`uorb top` emit these (clear-screen,
@@ -224,6 +228,7 @@ class Broker:
         self._serial_lock = threading.Lock()
         self._linebuf = LineBuffer()
         self._board = None          # detected 'HW arch' board name, or None
+        self._flashing = False      # True while a FLASH subprocess is running
 
         self._clients = set()
         self._clients_lock = threading.Lock()
@@ -296,6 +301,35 @@ class Broker:
         self._log.log_status(msg)
         self._broadcast("STATUS " + msg)
         self._emit("status", msg)
+
+    # ---- flash --------------------------------------------------------
+    def _set_flash_status(self, msg):
+        self._log.log_status("flash " + msg)
+        self._broadcast("FLASH " + msg)
+        self._emit("flash", msg)
+
+    def _on_flash_done(self, msg):
+        self._flashing = False
+        self._set_flash_status(msg)
+
+    def flash(self, target):
+        if getattr(self, "_flashing", False):
+            self._set_flash_status("error: busy")
+            return
+        target = target.strip()
+        if not valid_target(target):
+            # Reject flag smuggling / metacharacters before they reach make.
+            self._set_flash_status("error: invalid target")
+            return
+        self._flashing = True
+        self._set_flash_status("starting " + target)
+        cmd = build_flash_cmd(target, _REPO_ROOT)
+        t = threading.Thread(
+            target=run_flash,
+            args=(cmd, self._set_flash_status, self._on_flash_done),
+            kwargs={"cwd": _REPO_ROOT},
+            daemon=True)
+        t.start()
 
     # ---- serial side --------------------------------------------------
     def _serial_loop(self):
@@ -413,6 +447,8 @@ class Broker:
                 line = line.rstrip("\n")
                 if line.startswith("SEND "):
                     self.send(line[5:], "SKILL")
+                elif line.startswith("FLASH "):
+                    self.flash(line[6:].strip())
                 elif line == "PING":
                     with self._clients_lock:
                         try:
@@ -501,6 +537,12 @@ class ConsoleGUI:
                                      anchor="w")
         self._board_label.pack(side="left")
 
+        tk.Label(hdr, text="  Flash:", fg="#8a8a8a", bg="#141414").pack(side="left", padx=(12, 2))
+        self._flash_label = tk.Label(hdr, text="idle", fg="#8a8a8a",
+                                     bg="#141414", font=("monospace", 11),
+                                     anchor="w")
+        self._flash_label.pack(side="left")
+
         self._text = tk.Text(self._root, bg="#101010", fg="#d0d0d0",
                              insertbackground="#d0d0d0",
                              font=("monospace", 11), state="disabled", wrap="char")
@@ -573,6 +615,8 @@ class ConsoleGUI:
                 self._update_status(payload)
             elif kind == "board":
                 self._update_board(payload)
+            elif kind == "flash":
+                self._update_flash(payload)
 
     def _update_board(self, name):
         if name:
@@ -580,6 +624,15 @@ class ConsoleGUI:
             self._root.title("PX4 Console - %s - %s" % (name, self._broker_port()))
         else:
             self._board_label.configure(text="(detecting…)", fg="#ffd75f")
+
+    def _update_flash(self, msg):
+        if msg.startswith("error"):
+            color = "#ff5f5f"
+        elif msg == "done":
+            color = "#5fd75f"
+        else:
+            color = "#ffd75f"
+        self._flash_label.configure(text=msg, fg=color)
 
     def _refresh_board(self):
         self._board_label.configure(text="(detecting…)", fg="#ffd75f")

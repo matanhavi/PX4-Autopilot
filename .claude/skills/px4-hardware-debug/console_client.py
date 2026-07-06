@@ -26,7 +26,13 @@ class Console:
             raise ConnectionError(
                 "no console broker on %s:%s - start it with "
                 "console.py [--headless]" % (host, port)) from e
+        # create_connection leaves connect_timeout on the socket; clear it so the
+        # reader thread blocks indefinitely on readline() instead of dying with
+        # socket.timeout during idle gaps (e.g. between flash progress bursts, or
+        # a quiet board). read()/read_until() have their own queue timeouts.
+        self._sock.settimeout(None)
         self.statuses = []
+        self.flash_status = []     # inbound FLASH status lines, in arrival order
         self.board = None          # last board name the broker detected, or None
         self._q = queue.Queue()
         self._running = True
@@ -43,14 +49,19 @@ class Console:
             if not line:
                 break
             line = line.rstrip("\n")
-            if line.startswith("OUT "):
-                self._q.put(line[4:])
-            elif line.startswith("STATUS "):
-                self.statuses.append(line[7:])
-            elif line.startswith("BOARD "):
-                name = line[6:]
-                self.board = None if name == "?" else name
-            # PONG and anything else are ignored
+            self._classify(line)
+
+    def _classify(self, line):
+        if line.startswith("OUT "):
+            self._q.put(line[4:])
+        elif line.startswith("FLASH "):
+            self.flash_status.append(line[6:])
+        elif line.startswith("STATUS "):
+            self.statuses.append(line[7:])
+        elif line.startswith("BOARD "):
+            name = line[6:]
+            self.board = None if name == "?" else name
+        # PONG and anything else are ignored
 
     def send(self, text):
         self._sock.sendall(("SEND " + text + "\n").encode("utf-8", "replace"))
@@ -80,6 +91,21 @@ class Console:
             if marker in line:
                 break
         return "\n".join(lines)
+
+    def flash(self, target):
+        # Raw FLASH line (NOT via send(), which prepends "SEND " and would make
+        # the broker type "FLASH <target>" into NSH instead of dispatching it).
+        self._sock.sendall(("FLASH " + target + "\n").encode("utf-8", "replace"))
+
+    def wait_flash_done(self, timeout=180):
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.flash_status:
+                last = self.flash_status[-1]
+                if last == "done" or last.startswith("error"):
+                    return last
+            time.sleep(0.2)
+        return None
 
     def close(self):
         self._running = False
@@ -116,8 +142,16 @@ class Console:
 
 if __name__ == "__main__":
     # Tiny CLI: `console_client.py ver all` sends and prints ~2s of output.
+    # `console_client.py --flash <target>` triggers a flash and streams status.
     c = Console()
-    if len(sys.argv) > 1:
+    if len(sys.argv) > 2 and sys.argv[1] == "--flash":
+        c.flash(sys.argv[2])
+        print("flashing", sys.argv[2], "...")
+        result = c.wait_flash_done()
+        for s in c.flash_status:
+            print("  ", s)
+        print("result:", result)
+    elif len(sys.argv) > 1:
         c.send(" ".join(sys.argv[1:]))
-    print(c.read(timeout=2.0))
+        print(c.read(timeout=2.0))
     c.close()

@@ -352,6 +352,25 @@ The uploader is waiting for the board to enter bootloader mode. Try in order:
 After a successful flash the board reboots automatically. Wait ~5 s, then reconnect.
 Kill the background auto-attach loop once you're done if you don't want it persisting.
 
+### Flash from the console (live status in the header)
+
+If the shared console broker is running, you can flash **through it** — the
+`Flash:` header line then shows `starting → found board → erasing X% →
+programming X% → rebooting → done`, the whole flash is timestamped in the
+session log, and the post-flash boot log lands in the same pane.
+
+    from console_client import Console
+    c = Console()
+    c.flash("aerium_apex_h7_rev_a_default")
+    print(c.wait_flash_done())   # "done" or "error: ..."
+
+Or from the CLI: `python3 console_client.py --flash aerium_apex_h7_rev_a_default`.
+
+> **WSL:** the board still re-enumerates into the bootloader (different VID:PID),
+> so the `usbipd ... --auto-attach` loop from §5 Step 2 must be running first.
+> (Auto-managing it from the console is a future add — see FLASH_STATUS_PLAN.md
+> Task 7.)
+
 ### Step 3 — Verify
 
 Run `dmesg` via the shell and confirm the previously failing drivers now appear without errors.
