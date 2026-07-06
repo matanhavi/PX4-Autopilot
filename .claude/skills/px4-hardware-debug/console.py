@@ -3,6 +3,7 @@
 interface and an optional tkinter GUI. See the px4-hardware-debug SKILL.md."""
 
 import argparse
+import glob
 import json
 import os
 import queue
@@ -42,22 +43,18 @@ def strip_ansi(text):
 _HWARCH_RE = re.compile(r"HW arch:\s*(\S+)")
 
 
-def usb_info(port):
-    """Best-effort USB identity for a serial device, for the header/log.
+def usb_fields(port):
+    """Best-effort structured USB identity for a serial device.
 
-    Returns a one-line string like::
-
-        /dev/ttyUSB0  ·  bus 1-2  ·  by-path 0:2  ·  FTDI FT232R USB UART
-        ·  0403:6001  ·  SN A5069RR4
-
-    The physical bus path ('1-2') and by-path ('0:2') are what actually tell
-    two adapters apart -- the ttyUSBx number can swap on replug, and cheap
-    FTDIs often share one serial, so neither is a reliable identifier alone.
-    Falls back to just the resolved device path when /sys is unavailable
-    (e.g. a non-USB port), and never raises.
+    Returns a dict with keys 'path', 'bus', 'by_path', 'name', 'ids' (vid:pid)
+    and 'serial'; each missing field is ''. The physical bus path ('1-2') and
+    by-path ('0:2') are what actually tell two adapters apart -- the ttyUSBx
+    number can swap on replug, and cheap FTDIs often share one serial. Never
+    raises; falls back to just the resolved device path on a non-USB port.
     """
     real = os.path.realpath(port)
-    fields = [real]
+    f = {"path": real, "bus": "", "by_path": "", "name": "",
+         "ids": "", "serial": ""}
     try:
         sysdev = "/sys/class/tty/%s/device" % os.path.basename(real)
         node = os.path.realpath(sysdev)
@@ -73,28 +70,66 @@ def usb_info(port):
                 return None
 
         if node and node != "/":
-            fields.append("bus %s" % os.path.basename(node))   # e.g. 1-2
+            f["bus"] = os.path.basename(node)                  # e.g. 1-2
         bp_dir = "/dev/serial/by-path"
         if os.path.isdir(bp_dir):
             for link in os.listdir(bp_dir):
                 if os.path.realpath(os.path.join(bp_dir, link)) == real:
-                    # ...-usb-0:2:1.0-port0 -> show the '0:2' port hint
-                    m = re.search(r"usb-(\d+:\d+)", link)
-                    fields.append("by-path %s" % (m.group(1) if m else link))
+                    m = re.search(r"usb-(\d+:\d+)", link)      # ...-usb-0:2:1.0-port0
+                    f["by_path"] = m.group(1) if m else link
                     break
-        label = " ".join(x for x in (_read("manufacturer"),
-                                     _read("product")) if x)
-        if label:
-            fields.append(label)
+        f["name"] = " ".join(x for x in (_read("manufacturer"),
+                                         _read("product")) if x)
         vid, pid = _read("idVendor"), _read("idProduct")
         if vid and pid:
-            fields.append("%s:%s" % (vid, pid))
-        serial = _read("serial")
-        if serial:
-            fields.append("SN %s" % serial)
+            f["ids"] = "%s:%s" % (vid, pid)
+        f["serial"] = _read("serial") or ""
     except Exception:
         pass
-    return "  ·  ".join(fields)
+    return f
+
+
+def usb_tech_line(f):
+    """The technical identifiers from usb_fields() as one string, excluding the
+    human name: path · bus · by-path · vid:pid · SN. Used for the header table."""
+    parts = [f["path"]]
+    if f["bus"]:
+        parts.append("bus " + f["bus"])
+    if f["by_path"]:
+        parts.append("by-path " + f["by_path"])
+    if f["ids"]:
+        parts.append(f["ids"])
+    if f["serial"]:
+        parts.append("SN " + f["serial"])
+    return "  ·  ".join(parts)
+
+
+def usb_info(port):
+    """One-line USB identity (path · bus · by-path · name · ids · SN) for the
+    session log. See usb_fields() for the structured form used by the header."""
+    f = usb_fields(port)
+    parts = [f["path"]]
+    if f["bus"]:
+        parts.append("bus " + f["bus"])
+    if f["by_path"]:
+        parts.append("by-path " + f["by_path"])
+    if f["name"]:
+        parts.append(f["name"])
+    if f["ids"]:
+        parts.append(f["ids"])
+    if f["serial"]:
+        parts.append("SN " + f["serial"])
+    return "  ·  ".join(parts)
+
+
+def board_usb_port():
+    """The board's own USB CDC/ACM tty (/dev/ttyACM*), or None if not attached.
+
+    The FTDI console adapter enumerates as ttyUSB*, so the board's direct USB
+    (MAVLink / bootloader) is the ACM device. Used for the GUI board-USB row.
+    """
+    acms = sorted(glob.glob("/dev/ttyACM*"))
+    return acms[0] if acms else None
 
 
 # External, user-editable keyword highlighting config (JSON: color -> [keywords]).
@@ -513,17 +548,41 @@ class ConsoleGUI:
                          % (self._broker_port(), self._broker._baud))
         self._root.configure(bg="#1c1c1c")
 
-        top = tk.Frame(self._root, bg="#1c1c1c")
-        top.pack(fill="x")
-        self._status = tk.Label(top, text="● connecting  ·  %s"
+        # Connections table: two grid-aligned rows (a role tag, then the device
+        # name, then the technical identifiers) plus the link/log status on the
+        # far right. Row 0 is the FTDI serial console this window owns; row 1 is
+        # the board's own USB, polled since it comes and goes (notably it drops
+        # and returns during a flash). Sharing one grid keeps the columns aligned.
+        conn = tk.Frame(self._root, bg="#1c1c1c")
+        conn.pack(fill="x")
+        conn.columnconfigure(3, weight=1)          # push status to the far right
+
+        def _tag(text, fg):
+            return tk.Label(conn, text=text, fg=fg, bg="#2a2a2a",
+                            font=("monospace", 9, "bold"), padx=6)
+
+        def _cell(text, fg="#8a8a8a", weight="normal"):
+            return tk.Label(conn, text=text, fg=fg, bg="#1c1c1c", anchor="w",
+                            font=("monospace", 9, weight))
+
+        sf = usb_fields(self._broker_port())
+        _tag("serial", "#5fd7ff").grid(row=0, column=0, sticky="w",
+                                       padx=(6, 8), pady=(3, 1))
+        _cell(sf["name"] or "(unknown)", fg="#d0d0d0", weight="bold").grid(
+            row=0, column=1, sticky="w", padx=(0, 12))
+        _cell(usb_tech_line(sf)).grid(row=0, column=2, sticky="w")
+        self._status = tk.Label(conn, text="● connecting  ·  %s"
                                 % os.path.basename(self._log_path),
                                 fg="#ffd75f", bg="#1c1c1c", anchor="e")
-        self._status.pack(side="right", padx=6, pady=2)
-        # USB identity header: which physical adapter this window is bound to,
-        # so a swapped ttyUSBx number or shared FTDI serial can't mislead.
-        tk.Label(top, text=usb_info(self._broker_port()),
-                 fg="#8a8a8a", bg="#1c1c1c", anchor="w",
-                 font=("monospace", 9)).pack(side="left", padx=6, pady=2)
+        self._status.grid(row=0, column=3, rowspan=2, sticky="e", padx=6)
+
+        _tag("usb", "#5fd75f").grid(row=1, column=0, sticky="w",
+                                    padx=(6, 8), pady=(1, 3))
+        self._usb_name_label = _cell("", fg="#d0d0d0", weight="bold")
+        self._usb_name_label.grid(row=1, column=1, sticky="w", padx=(0, 12))
+        self._usb_tech_label = _cell("")
+        self._usb_tech_label.grid(row=1, column=2, sticky="w")
+        self._refresh_usb_row()
 
         # Board identity header: the HW arch reported by 'ver all', so you always
         # know WHICH board answered on this console. Refresh re-runs the probe.
@@ -543,19 +602,35 @@ class ConsoleGUI:
                                      anchor="w")
         self._flash_label.pack(side="left")
 
-        self._text = tk.Text(self._root, bg="#101010", fg="#d0d0d0",
+        text_frame = tk.Frame(self._root, bg="#101010")
+        text_frame.pack(fill="both", expand=True)
+        self._scroll = tk.Scrollbar(text_frame, command=self._on_scroll)
+        self._scroll.pack(side="right", fill="y")
+        self._text = tk.Text(text_frame, bg="#101010", fg="#d0d0d0",
                              insertbackground="#d0d0d0",
-                             font=("monospace", 11), state="disabled", wrap="char")
-        self._text.pack(fill="both", expand=True)
+                             font=("monospace", 11), state="disabled", wrap="char",
+                             yscrollcommand=self._scroll.set)
+        self._text.pack(side="left", fill="both", expand=True)
         for tag, color in self.COLORS.items():
             self._text.tag_configure(tag, foreground=color)
         # Keyword highlight tags (raised above the base OUT tag so they win).
         for color in sorted(set(c for _, c in self._rules)):
             self._text.tag_configure("kw_" + color, foreground=color)
             self._text.tag_raise("kw_" + color)
+        # Visible selection highlight on the dark background (a disabled Text
+        # can still be mouse-selected and copied).
+        self._text.tag_configure("sel", background="#2b4a6f")
         self._text.bind("<MouseWheel>", self._pause_autoscroll)
         self._text.bind("<Button-4>", self._pause_autoscroll)
         self._text.bind("<Button-5>", self._pause_autoscroll)
+        # Right-click menu on the output: copy the current selection.
+        self._out_menu = tk.Menu(self._root, tearoff=0)
+        self._out_menu.add_command(label="Copy", command=self._copy_output)
+        self._out_menu.add_command(label="Select all", command=self._select_all_output)
+        self._out_menu.add_separator()
+        self._out_menu.add_command(label="Clear", command=self._clear)
+        self._text.bind("<Button-3>", self._show_out_menu)
+        self._text.bind("<Control-c>", self._copy_output_evt)
 
         bottom = tk.Frame(self._root, bg="#1c1c1c")
         bottom.pack(fill="x")
@@ -566,6 +641,13 @@ class ConsoleGUI:
         self._entry.bind("<Return>", self._on_enter)
         self._entry.bind("<Up>", self._history_prev)
         self._entry.bind("<Down>", self._history_next)
+        # Right-click menu on the command line: paste (newlines collapsed so a
+        # command copied out of the output pastes as one line), copy, cut.
+        self._entry_menu = tk.Menu(self._root, tearoff=0)
+        self._entry_menu.add_command(label="Paste", command=self._paste_entry)
+        self._entry_menu.add_command(label="Copy", command=self._copy_entry)
+        self._entry_menu.add_command(label="Cut", command=self._cut_entry)
+        self._entry.bind("<Button-3>", self._show_entry_menu)
         tk.Button(bottom, text="Clear", command=self._clear).pack(side="right", padx=4)
         self._entry.focus_set()
 
@@ -638,6 +720,18 @@ class ConsoleGUI:
         self._board_label.configure(text="(detecting…)", fg="#ffd75f")
         self._broker.probe_board()
 
+    def _refresh_usb_row(self):
+        port = board_usb_port()
+        if port:
+            f = usb_fields(port)
+            self._usb_name_label.configure(text=f["name"] or "(unknown)",
+                                           fg="#d0d0d0")
+            self._usb_tech_label.configure(text=usb_tech_line(f), fg="#8a8a8a")
+        else:
+            self._usb_name_label.configure(text="(not connected)", fg="#6a6a6a")
+            self._usb_tech_label.configure(text="", fg="#6a6a6a")
+        self._root.after(2000, self._refresh_usb_row)
+
     def _update_status(self, payload):
         logname = os.path.basename(self._log_path)
         if payload.startswith("connected"):
@@ -691,6 +785,59 @@ class ConsoleGUI:
             self._autoscroll = self._text.yview()[1] >= 0.999
         except Exception:
             pass
+
+    def _on_scroll(self, *args):
+        # Scrollbar drag/click: scroll the text, then reassess autoscroll (stays
+        # on only while the view is parked at the bottom).
+        self._text.yview(*args)
+        self._pause_autoscroll(None)
+
+    # ---- copy / paste -------------------------------------------------
+    def _show_out_menu(self, event):
+        try:
+            self._out_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._out_menu.grab_release()
+
+    def _copy_output(self):
+        try:
+            sel = self._text.get("sel.first", "sel.last")
+        except Exception:
+            return                       # nothing selected
+        if sel:
+            self._root.clipboard_clear()
+            self._root.clipboard_append(sel)
+
+    def _copy_output_evt(self, _event):
+        self._copy_output()
+        return "break"
+
+    def _select_all_output(self):
+        self._text.tag_add("sel", "1.0", "end-1c")
+
+    def _show_entry_menu(self, event):
+        try:
+            self._entry_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._entry_menu.grab_release()
+
+    def _paste_entry(self):
+        try:
+            text = self._root.clipboard_get()
+        except Exception:
+            return                       # empty / non-text clipboard
+        # The command line is single-line; collapse newlines so a multi-line
+        # copy (e.g. a wrapped command from the output) pastes as one command.
+        text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        if self._entry.selection_present():
+            self._entry.delete("sel.first", "sel.last")
+        self._entry.insert("insert", text)
+
+    def _copy_entry(self):
+        self._entry.event_generate("<<Copy>>")
+
+    def _cut_entry(self):
+        self._entry.event_generate("<<Cut>>")
 
     def _clear(self):
         self._text.configure(state="normal")
