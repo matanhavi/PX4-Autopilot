@@ -201,6 +201,24 @@ dd if=/dev/ttyUSB0 bs=1 count=50 2>/dev/null | xxd
 - MAVLink binary (`fe`/`fd` bytes) → MAVLink is on this port, not the console
 - Silence → wrong connector, wrong baud, or port not configured
 
+**Total silence but the board is alive on USB (heartbeat on `/dev/ttyACM*`) → the
+firmware has no serial console on that UART.** The classic tell: `ver all` / any
+command produces *zero* `OUT` bytes over the FTDI, yet a MAVLink heartbeat comes
+back on the board's USB — so the MCU is running, the console UART just isn't
+assigned. Check the board's NuttX defconfig for a `CONFIG_UARTx_SERIAL_CONSOLE=y`
+(or `CONFIG_USARTx_SERIAL_CONSOLE=y`) matching the UART your FTDI is wired to:
+
+```bash
+grep -nE 'SERIAL_CONSOLE|CONFIG_NO_SERIAL_CONSOLE' \
+  boards/<mfr>/<board>/nuttx-config/nsh/defconfig
+```
+
+If none is `=y` (or `CONFIG_NO_SERIAL_CONSOLE=y` is set), the console is disabled
+in firmware — no cabling/baud change will help. Enable the right
+`CONFIG_UARTx_SERIAL_CONSOLE=y` for the console UART, rebuild, and re-flash. (Seen
+on Aerium Apex H7 rev A: UART8 console was off; setting
+`CONFIG_UART8_SERIAL_CONSOLE=y` fixed it.)
+
 ### Fallback: MAVLink shell (USB only)
 
 Use when no serial adapter is available. Gives text shell access but no boot log.
