@@ -48,20 +48,40 @@ Expected devices:
 
 If a device the user expects is missing, stop and ask them to check the cable/USB before continuing.
 
-On WSL, USB devices must be attached from Windows first. List them and find the board's busid:
-```powershell
-usbipd list   # run via: powershell.exe -Command "usbipd list"
+On WSL, USB devices live on the Windows host and must be bound + attached into WSL
+first. **Use the `pxusb.py` helper** — it recognizes the PX4 debug devices *by
+identity* (FTDI/CP210x console, ST-Link JTAG, board VCP/bootloader), does the
+one-time elevated `bind` for all of them in a **single** UAC prompt, attaches
+them, and prints the `/dev` mapping — so you never chase reshuffling busids:
+
+```bash
+python3 .claude/skills/px4-hardware-debug/pxusb.py            # status: what's present + state
+python3 .claude/skills/px4-hardware-debug/pxusb.py attach     # bind (1 UAC) + attach ALL recognized
+python3 .claude/skills/px4-hardware-debug/pxusb.py attach console jtag   # only some roles
+python3 .claude/skills/px4-hardware-debug/pxusb.py detach     # remove from WSL (no admin needed)
 ```
-Devices show `Shared` (available) or `Attached` (already on WSL). Attach the board and the
-FTDI adapter by busid:
-```powershell
-usbipd attach --wsl --busid 2-1   # board USB
-usbipd attach --wsl --busid 2-7   # FTDI UART adapter
+
+Example `status` output — each device tagged with its role and resulting node:
 ```
-After attaching, the device appears under `/dev/serial/by-id/` and `/dev/ttyACM*` / `/dev/ttyUSB*`.
+ROLE     BUSID  VID:PID     STATE      DEVICE
+console  3-4    0403:6001   attached   USB Serial Converter    -> /dev/ttyUSB0
+jtag     4-1    0483:3752   attached   ST-Link Debug           -> /dev/ttyACM0
+board    4-2    1b8c:0036   attached   Aerium Apex H7 (app VCP) -> /dev/ttyACM1
+```
+
+If `bind` needs elevation and the UAC is declined, the helper prints the exact
+one-time `usbipd bind --busid <b>` lines to run in an **admin** PowerShell
+(binding persists by hardware-id, so it is a one-time step per device). Doesn't
+recognize your board? Add its VID:PID to `RECOGNITION` at the top of `pxusb.py`.
+
+Under the hood it is just `usbipd`; the manual path is `powershell.exe -Command
+"usbipd state"` (JSON) or `"usbipd list"`, then `usbipd bind`/`attach --wsl
+--busid <b>`. **Attach by VID:PID identity, not a remembered busid — busids
+reshuffle on every replug/reboot.**
 
 > **For flashing on WSL, a plain attach is not enough — see §5 Step 2.** The board re-enumerates
 > with a different VID:PID when it drops into the bootloader, and usbipd loses it mid-flash.
+> `pxusb.py autoattach board` runs the required auto-attach loop for you.
 
 ---
 
@@ -344,8 +364,10 @@ flash never lands. Run the auto-attach loop in the background before uploading; 
 the device the instant it re-enumerates:
 
 ```bash
-# background, stays running across the whole flash:
-powershell.exe -Command "usbipd attach --wsl --busid 2-1 --auto-attach" &
+# background, stays running across the whole flash (resolves the busid by identity):
+python3 .claude/skills/px4-hardware-debug/pxusb.py autoattach board &
+# equivalent raw form if you know the busid:
+#   powershell.exe -Command "usbipd attach --wsl --busid 2-1 --auto-attach" &
 ```
 
 Then upload:

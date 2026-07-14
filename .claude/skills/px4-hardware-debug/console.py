@@ -132,6 +132,20 @@ def board_usb_port():
     return acms[0] if acms else None
 
 
+def endpoint_info(path):
+    """(name, tech) for an endpoint device currently present, else None ('n/a').
+
+    Accepts a stable /dev/serial/by-id/... path (or bare tty); resolves it and
+    returns None when the device isn't attached, so the header can show 'n/a'.
+    """
+    if not path:
+        return None
+    if not os.path.exists(os.path.realpath(path)):
+        return None
+    f = usb_fields(path)
+    return (f["name"], usb_tech_line(f))
+
+
 # External, user-editable keyword highlighting config (JSON: color -> [keywords]).
 COLOR_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "console_colors.json")
@@ -209,11 +223,14 @@ class LineBuffer:
 class SessionLog:
     """Writes a timestamped transcript: one event per line, source-tagged."""
 
-    def __init__(self, log_dir, now=datetime.now):
+    def __init__(self, log_dir, now=datetime.now, label=None):
         self._now = now
         os.makedirs(log_dir, exist_ok=True)
         stamp = now().strftime("%Y%m%d-%H%M%S")
-        self.path = os.path.join(log_dir, "session-%s.log" % stamp)
+        # Label (e.g. the broker's TCP port) keeps two consoles started in the
+        # same second from colliding on one interleaved log file.
+        suffix = ("-%s" % label) if label else ""
+        self.path = os.path.join(log_dir, "session-%s%s.log" % (stamp, suffix))
         self._fh = open(self.path, "a", buffering=1, encoding="utf-8")
         self._lock = threading.Lock()
 
@@ -252,12 +269,18 @@ class Broker:
     GUI callback; accepts input from TCP clients (and the GUI via send())."""
 
     def __init__(self, port, baud, tcp_port, session_log,
-                 serial_factory=open_serial, on_event=None):
+                 serial_factory=open_serial, on_event=None,
+                 owns_board_usb=False):
         self._port = port
         self._baud = baud
         self._log = session_log
         self._serial_factory = serial_factory
         self.on_event = on_event
+        # True when this console owns the board's own USB VCP (MAVLink transport).
+        # A flash (make upload) needs that same port, so we release it during the
+        # flash and let the reconnect loop re-acquire it afterwards.
+        self._owns_board_usb = owns_board_usb
+        self._flash_release = False
 
         self._serial = None
         self._serial_lock = threading.Lock()
@@ -345,6 +368,7 @@ class Broker:
 
     def _on_flash_done(self, msg):
         self._flashing = False
+        self._flash_release = False      # resume reconnect (re-acquire the VCP)
         self._set_flash_status(msg)
 
     def flash(self, target):
@@ -357,6 +381,9 @@ class Broker:
             self._set_flash_status("error: invalid target")
             return
         self._flashing = True
+        if getattr(self, "_owns_board_usb", False):
+            # Release our USB VCP so make upload can drive the bootloader.
+            self._flash_release = True
         self._set_flash_status("starting " + target)
         cmd = build_flash_cmd(target, _REPO_ROOT)
         t = threading.Thread(
@@ -369,6 +396,19 @@ class Broker:
     # ---- serial side --------------------------------------------------
     def _serial_loop(self):
         while self._running:
+            if getattr(self, "_flash_release", False):
+                # A flash needs our port (MAVLink console). Release and hold until
+                # the flash finishes; the board also re-enumerates during upload.
+                with self._serial_lock:
+                    if self._serial is not None:
+                        try:
+                            self._serial.close()
+                        except OSError:
+                            pass
+                        self._serial = None
+                self._announce_disconnected()
+                threading.Event().wait(0.3)
+                continue
             with self._serial_lock:
                 have = self._serial is not None
             if not have:
@@ -525,11 +565,19 @@ class ConsoleGUI:
         "AUTO": "#6a6a6a",    # dim - console's own auto-probe (ver all)
     }
 
-    def __init__(self, broker, log_path, color_rules=None):
+    def __init__(self, broker, log_path, color_rules=None,
+                 endpoints=None, owned="serial", board_name=None):
         self._broker = broker
         self._log_path = log_path
         self._rules = (color_rules if color_rules is not None
                        else load_keyword_colors(COLOR_CONFIG))
+        # Three fixed header lines. The 'owned' role is the transport this broker
+        # actually drives (and whose connection status we show); the others are
+        # informational. A None endpoint renders as 'n/a'.
+        self._endpoints = endpoints or {"serial": broker._port,
+                                        "usb": None, "jtag": None}
+        self._owned = owned
+        self._board_name = board_name
         self._events = queue.Queue()
         self._history = []
         self._hist_idx = None
@@ -544,15 +592,31 @@ class ConsoleGUI:
         import tkinter as tk
         self._tk = tk
         self._root = tk.Tk()
-        self._root.title("PX4 Console - %s @ %d"
-                         % (self._broker_port(), self._broker._baud))
+        self._root.title("PX4 Console - %s" % (self._board_name or "(detecting…)"))
         self._root.configure(bg="#1c1c1c")
 
-        # Connections table: two grid-aligned rows (a role tag, then the device
-        # name, then the technical identifiers) plus the link/log status on the
-        # far right. Row 0 is the FTDI serial console this window owns; row 1 is
-        # the board's own USB, polled since it comes and goes (notably it drops
-        # and returns during a flash). Sharing one grid keeps the columns aligned.
+        # Board identity ON TOP: the HW arch reported by 'ver all' (or --name), so
+        # you always know WHICH board this console is. Refresh re-runs the probe.
+        hdr = tk.Frame(self._root, bg="#141414")
+        hdr.pack(fill="x")
+        tk.Button(hdr, text="↻ Refresh",
+                  command=self._refresh_board).pack(side="right", padx=4, pady=2)
+        tk.Label(hdr, text="Board:", fg="#8a8a8a", bg="#141414").pack(side="left", padx=(6, 2))
+        self._board_label = tk.Label(
+            hdr, text=self._board_name or "(detecting…)",
+            fg="#5fd7ff" if self._board_name else "#ffd75f",
+            bg="#141414", font=("monospace", 11, "bold"), anchor="w")
+        self._board_label.pack(side="left")
+        tk.Label(hdr, text="  Flash:", fg="#8a8a8a", bg="#141414").pack(side="left", padx=(12, 2))
+        self._flash_label = tk.Label(hdr, text="idle", fg="#8a8a8a",
+                                     bg="#141414", font=("monospace", 11),
+                                     anchor="w")
+        self._flash_label.pack(side="left")
+
+        # Three fixed connection lines: serial / usb / jtag. Each shows the
+        # device identity or 'n/a'. The link/log status sits on the line for the
+        # transport this broker owns (serial for an FTDI console, usb for a
+        # MAVLink-shell console). Devices are polled since they come and go.
         conn = tk.Frame(self._root, bg="#1c1c1c")
         conn.pack(fill="x")
         conn.columnconfigure(3, weight=1)          # push status to the far right
@@ -565,42 +629,24 @@ class ConsoleGUI:
             return tk.Label(conn, text=text, fg=fg, bg="#1c1c1c", anchor="w",
                             font=("monospace", 9, weight))
 
-        sf = usb_fields(self._broker_port())
-        _tag("serial", "#5fd7ff").grid(row=0, column=0, sticky="w",
-                                       padx=(6, 8), pady=(3, 1))
-        _cell(sf["name"] or "(unknown)", fg="#d0d0d0", weight="bold").grid(
-            row=0, column=1, sticky="w", padx=(0, 12))
-        _cell(usb_tech_line(sf)).grid(row=0, column=2, sticky="w")
-        self._status = tk.Label(conn, text="● connecting  ·  %s"
-                                % os.path.basename(self._log_path),
-                                fg="#ffd75f", bg="#1c1c1c", anchor="e")
-        self._status.grid(row=0, column=3, rowspan=2, sticky="e", padx=6)
-
-        _tag("usb", "#5fd75f").grid(row=1, column=0, sticky="w",
-                                    padx=(6, 8), pady=(1, 3))
-        self._usb_name_label = _cell("", fg="#d0d0d0", weight="bold")
-        self._usb_name_label.grid(row=1, column=1, sticky="w", padx=(0, 12))
-        self._usb_tech_label = _cell("")
-        self._usb_tech_label.grid(row=1, column=2, sticky="w")
-        self._refresh_usb_row()
-
-        # Board identity header: the HW arch reported by 'ver all', so you always
-        # know WHICH board answered on this console. Refresh re-runs the probe.
-        hdr = tk.Frame(self._root, bg="#141414")
-        hdr.pack(fill="x")
-        tk.Button(hdr, text="↻ Refresh",
-                  command=self._refresh_board).pack(side="right", padx=4, pady=2)
-        tk.Label(hdr, text="Board:", fg="#8a8a8a", bg="#141414").pack(side="left", padx=(6, 2))
-        self._board_label = tk.Label(hdr, text="(detecting…)", fg="#ffd75f",
-                                     bg="#141414", font=("monospace", 11, "bold"),
-                                     anchor="w")
-        self._board_label.pack(side="left")
-
-        tk.Label(hdr, text="  Flash:", fg="#8a8a8a", bg="#141414").pack(side="left", padx=(12, 2))
-        self._flash_label = tk.Label(hdr, text="idle", fg="#8a8a8a",
-                                     bg="#141414", font=("monospace", 11),
-                                     anchor="w")
-        self._flash_label.pack(side="left")
+        role_colors = {"serial": "#5fd7ff", "usb": "#5fd75f", "jtag": "#d78fff"}
+        self._ep_name = {}
+        self._ep_tech = {}
+        self._status = None
+        for row, role in enumerate(("serial", "usb", "jtag")):
+            _tag(role, role_colors[role]).grid(row=row, column=0, sticky="w",
+                                               padx=(6, 8), pady=(2, 2))
+            self._ep_name[role] = _cell("", fg="#d0d0d0", weight="bold")
+            self._ep_name[role].grid(row=row, column=1, sticky="w", padx=(0, 12))
+            self._ep_tech[role] = _cell("")
+            self._ep_tech[role].grid(row=row, column=2, sticky="w")
+            if role == self._owned:
+                self._status = tk.Label(
+                    conn, text="● connecting  ·  %s"
+                    % os.path.basename(self._log_path),
+                    fg="#ffd75f", bg="#1c1c1c", anchor="e")
+                self._status.grid(row=row, column=3, sticky="e", padx=6)
+        self._refresh_endpoints()
 
         text_frame = tk.Frame(self._root, bg="#101010")
         text_frame.pack(fill="both", expand=True)
@@ -703,7 +749,9 @@ class ConsoleGUI:
     def _update_board(self, name):
         if name:
             self._board_label.configure(text=name, fg="#5fd7ff")
-            self._root.title("PX4 Console - %s - %s" % (name, self._broker_port()))
+            self._root.title("PX4 Console - %s" % name)
+        elif self._board_name:
+            self._board_label.configure(text=self._board_name, fg="#5fd7ff")
         else:
             self._board_label.configure(text="(detecting…)", fg="#ffd75f")
 
@@ -720,19 +768,24 @@ class ConsoleGUI:
         self._board_label.configure(text="(detecting…)", fg="#ffd75f")
         self._broker.probe_board()
 
-    def _refresh_usb_row(self):
-        port = board_usb_port()
-        if port:
-            f = usb_fields(port)
-            self._usb_name_label.configure(text=f["name"] or "(unknown)",
-                                           fg="#d0d0d0")
-            self._usb_tech_label.configure(text=usb_tech_line(f), fg="#8a8a8a")
-        else:
-            self._usb_name_label.configure(text="(not connected)", fg="#6a6a6a")
-            self._usb_tech_label.configure(text="", fg="#6a6a6a")
-        self._root.after(2000, self._refresh_usb_row)
+    def _refresh_endpoints(self):
+        for role in ("serial", "usb", "jtag"):
+            info = endpoint_info(self._endpoints.get(role))
+            if info is None:
+                self._ep_name[role].configure(text="n/a", fg="#6a6a6a")
+                self._ep_tech[role].configure(text="", fg="#6a6a6a")
+            else:
+                name, tech = info
+                name = name or "(unknown)"
+                if role == "usb" and self._owned == "usb":
+                    name += "  [MAVLink shell]"
+                self._ep_name[role].configure(text=name, fg="#d0d0d0")
+                self._ep_tech[role].configure(text=tech, fg="#8a8a8a")
+        self._root.after(2000, self._refresh_endpoints)
 
     def _update_status(self, payload):
+        if self._status is None:
+            return
         logname = os.path.basename(self._log_path)
         if payload.startswith("connected"):
             self._status.configure(text="● connected  ·  %s" % logname,
@@ -858,12 +911,26 @@ class ConsoleGUI:
 
 def _parse_args(argv):
     p = argparse.ArgumentParser(description="PX4 shared NSH console broker")
-    p.add_argument("--port", default="/dev/ttyUSB0")
+    p.add_argument("--serial",
+                   help="FTDI/UART console device (path or /dev/serial/by-id/...)")
+    p.add_argument("--usb",
+                   help="board USB VCP, driven over MAVLink SERIAL_CONTROL "
+                        "(path or by-id); use for boards with no UART console")
+    p.add_argument("--jtag",
+                   help="SWD/JTAG probe device, shown in the header (informational)")
+    p.add_argument("--name",
+                   help="board name shown on top (else auto-detected from HW arch)")
+    p.add_argument("--port", help="alias for --serial (back-compat)")
     p.add_argument("--baud", type=int, default=57600)
     p.add_argument("--tcp-port", type=int, default=DEFAULT_TCP_PORT)
     p.add_argument("--headless", action="store_true",
                    help="run without the GUI window")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.serial is None and args.port is not None:
+        args.serial = args.port
+    if args.serial is None and args.usb is None:
+        args.serial = "/dev/ttyUSB0"           # back-compat default
+    return args
 
 
 def main(argv=None):
@@ -875,23 +942,37 @@ def main(argv=None):
     if _C.ping(port=args.tcp_port, timeout=0.5):
         sys.stderr.write(
             "A console broker is already running on 127.0.0.1:%d; refusing to "
-            "start a second owner of %s.\n" % (args.tcp_port, args.port))
+            "start a second broker on this port.\n" % args.tcp_port)
         return 1
 
-    log = SessionLog(LOG_DIR)
+    # The transport this broker drives: an FTDI/UART serial console when --serial
+    # is set, otherwise the board's USB VCP over MAVLink (--usb). The one it owns
+    # carries the connection status; the others are informational header lines.
+    owned = "serial" if args.serial else "usb"
+    primary = args.serial if owned == "serial" else args.usb
+    if owned == "serial":
+        factory = open_serial
+    else:
+        from mavlink_serial import open_mavlink
+        factory = open_mavlink
+
+    log = SessionLog(LOG_DIR, label=str(args.tcp_port))
     # Record which physical USB adapter we're bound to at the top of the log
     # and on stdout, so a session transcript is self-describing even headless.
-    usb = usb_info(args.port)
+    usb = usb_info(primary)
     log.log_status("usb " + usb)
-    broker = Broker(args.port, args.baud, args.tcp_port, log)
+    broker = Broker(primary, args.baud, args.tcp_port, log, serial_factory=factory,
+                    owns_board_usb=(owned == "usb"))
     broker.start()
+
+    endpoints = {"serial": args.serial, "usb": args.usb, "jtag": args.jtag}
 
     if args.headless:
         sys.stdout.write(
             "[console] headless broker on 127.0.0.1:%d\n"
-            "[console] usb: %s\n"
+            "[console] %s: %s\n"
             "[console] logging to %s\n"
-            % (broker.tcp_port, usb, log.path))
+            % (broker.tcp_port, owned, usb, log.path))
         sys.stdout.flush()
         stop = threading.Event()
 
@@ -902,7 +983,8 @@ def main(argv=None):
         signal.signal(signal.SIGTERM, _stop)
         stop.wait()
     else:
-        gui = ConsoleGUI(broker, log.path)
+        gui = ConsoleGUI(broker, log.path, endpoints=endpoints,
+                         owned=owned, board_name=args.name)
         gui.run()
 
     broker.stop()
